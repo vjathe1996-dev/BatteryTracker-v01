@@ -1,38 +1,81 @@
 name: Build v1.0
+
 on:
   push:
   workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: 8.11.1
-      - run: unzip -q BatteryTracker.zip
-      - name: Build
+
+      - name: Unpack project
+        run: unzip -q BatteryTracker.zip
+
+      - name: Unit tests (do not block the build)
+        continue-on-error: true
         working-directory: BatteryTracker
-        env:
-          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Build debug APK
+        working-directory: BatteryTracker
+        run: gradle assembleDebug --no-daemon
+
+      - name: Build signed release (only when signing secrets exist)
+        if: env.KS_B64 != ''
+        working-directory: BatteryTracker
         run: |
-          if [ -n "$KS_B64" ]; then
-            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            export KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
-            gradle assembleRelease bundleRelease --no-daemon
-          else
-            gradle assembleDebug --no-daemon
-          fi
-      - uses: actions/upload-artifact@v4
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          gradle assembleRelease bundleRelease --no-daemon
+
+      - name: Check release build (shrinking test, no signing key yet)
+        if: env.KS_B64 == ''
+        continue-on-error: true
+        working-directory: BatteryTracker
+        run: gradle assembleRelease --no-daemon
+
+      - name: Upload build files
+        uses: actions/upload-artifact@v7
         with:
           name: BatteryTracker-v1.0
           path: |
-            BatteryTracker/app/build/outputs/apk/**/*.apk
+            BatteryTracker/app/build/outputs/apk/debug/*.apk
+            BatteryTracker/app/build/outputs/apk/release/*.apk
             BatteryTracker/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: Publish a Release page with the APK
+        if: github.ref_name == github.event.repository.default_branch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES=$(find BatteryTracker/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | grep -v unsigned || true)
+          [ -n "$FILES" ] || exit 1
+          gh release create "v1.0-build-${{ github.run_number }}" $FILES \
+            --title "Battery Tracker v1.0 (build ${{ github.run_number }})" \
+            --notes "Automatic build of commit ${{ github.sha }}." \
+            --prerelease
